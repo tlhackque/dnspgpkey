@@ -1,0 +1,106 @@
+#!/usr/bin/perl
+
+# Copyright (C) 2018 Timothe Litt litt at_ acm ddot org
+
+# generate an openpgpkey DNS record from a GPG keyring entry.
+#
+# Usage:
+#  dnspgpkey [options] email [email ...]
+#
+# Options:
+#   -n     Format record on one line (nsupdate-compatible)
+#          Default is zone file format (mult-line rdata)
+#   -t:n   Specify TTL for record
+#
+# Valid records on stdout (can feed to nsupdate or zone file).
+# Errors on stderr.
+
+use warnings;
+use strict;
+
+our $VERSION = '1.001';
+
+use Digest::SHA( qw/5.95/ );
+use Email::Address::XS( qw/1.02/ );
+use MIME::Base64();
+use Getopt::Std;
+$Getopt::Std::STANDARD_HELP_VERSION = 1;
+
+# Default TTL for record
+my $ttl = 24 * 60 * 60;
+
+# Width of base64 record in zone file format. 8 is leading tab.
+my $wid = 72 - 8;
+
+# gpg command - default is on PATH, $ENV allows override
+
+my $gpgcmd = $ENV{GPG} || q{gpg};
+$gpgcmd   .= q{ --export --export-options export-minimal,no-export-attributes};
+
+my %opts;
+getopts( 'n,t:', \%opts ) or do {
+    exit( 1 );
+};
+$ttl = $opts{t} if( defined $opts{t} );
+
+my $xit = 0;
+
+foreach my $email ( @ARGV ) {
+    # Parse address
+
+    my @user = Email::Address::XS::parse_email_addresses( $email );
+    @user == 1 && $user[0]->is_valid or do {
+        printf STDERR ( "%s: not valid\n", $email );
+        $xit ||= 1;
+        next;
+    };
+
+    # Extract and hash user part.  Only the most significant 28 octets
+    # of the hash are used in the key resource name.
+
+    my $user = $user[0]->user;
+    my $hash = substr( Digest::SHA::sha256_hex( $user ), 0, 28*2 );
+
+
+    # Extract transportable key from gpg keyring
+    # Result is zero-length if key not found.
+
+    my $key = qx{ $gpgcmd "$email" };
+    unless( defined $key && length $key && $? == 0 ) {
+        if( $? == -1 ) {
+            print STDERR ( "Filed to execute gpg: %s$!\n" );
+        } elsif( $? & 0x7F ) {
+            printf STDERR ( "gpg died with signal %d, %s coredump\n",
+                            ($? & 0x7f), ($? & 0x80)? 'with' : 'without' );
+        } elsif( $? != 0 ) {
+            printf STDERR ( "gpg exited with value %d\n", $? >> 8 );
+            next if( defined $key );
+        } elsif( length $key == 0 ) {
+            printf STDERR ( "%s: error from gpg\n", $email );
+            $xit ||= 1;
+            next;
+        }
+        exit( 1 );
+    }
+
+    # Encode binary as base64;
+    $key = MIME::Base64::encode_base64( $key,'' );
+
+    # Display hashed user (removing whitespace, commments, etc)
+
+    $email = "$user\@" . $user[0]->host;
+
+    # Generate the key.
+    if( $opts{n} ) { # nsupdate-compatible
+        printf( ";%s\n%s._openpgpkey.%s. %u IN OPENPGPKEY %s\n", $email, $hash,
+                $user[0]->host, $ttl, $key );
+    } else { # Zone file compatible
+        my $rec = sprintf( "%s._openpgpkey.%s. %u IN OPENPGPKEY (\n", $hash,
+                           $user[0]->host, $ttl );
+        print( $rec );
+        printf( "\t%s\n", substr( $key, 0, $wid, '' ) ) while( length $key );
+        printf( "%s) ;%s\n", ' ' x (length( $rec ) - 1), $email );
+    }
+}
+
+exit( $xit );
